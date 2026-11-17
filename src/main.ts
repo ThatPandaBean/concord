@@ -1,14 +1,23 @@
 import * as THREE from 'three';
-import { startSync } from './sync';
+import { phaseNow, startSync, wall, type Peer } from './sync';
+import { createChoir, RATIOS, ROOT_HZ } from './choir';
 import { COMMON, CORE_VS, FEYN_VS, FIELD_VS, GLOW_FS, GLOW_VS, SHELL_VS, SPRITE_FS, STAR_VS, STREAM_VS } from './shaders';
 
 const MAX = 4; // windows that get an orb
-// blue, red, yellow, paper: the open order picks the colour
+const TAU = Math.PI * 2;
+// blue, red, yellow, paper: the open order picks the colour (and the note)
 const COLS = [[0.25, 0.55, 1], [1, 0.28, 0.32], [1, 0.82, 0.25], [0.96, 0.93, 0.85]];
+const NAMES = ['blue', 'red', 'yellow', 'paper'];
 const PAIRS = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+const pairIndex = (a: number, b: number) => { // same as pid() in the shaders
+  const lo = Math.min(a, b), hi = Math.max(a, b);
+  return (lo * (7 - lo)) / 2 + hi - lo - 1;
+};
 const SPRING = 120, DAMP = 14; // damping ratio ~0.64: a dragged window tows its orb with a little bounce
+const COUPLING = 1; // rad/s of pull between fully paired orbs; two orbs lock when 2 * pull beats their rhythm difference
 
 const sync = startSync();
+const choir = createChoir();
 
 const renderer = new THREE.WebGLRenderer({ antialias: false });
 const dpr = Math.min(window.devicePixelRatio, 2);
@@ -26,7 +35,8 @@ const uniforms = {
   uOrigin: { value: new THREE.Vector2() },
   uView: { value: new THREE.Vector2(innerWidth, innerHeight) },
   uScreen: { value: new THREE.Vector2(screen.width, screen.height) },
-  uPair: { value: new Array<number>(PAIRS.length).fill(0) },
+  uFlow: { value: new Array<number>(PAIRS.length).fill(0) },
+  uPhase: { value: new Array<number>(MAX).fill(0) },
   uOv: { value: PAIRS.map(() => new THREE.Vector4()) },
   uTime: { value: 0 },
   uDpr: { value: dpr },
@@ -85,7 +95,8 @@ layer(FEYN_VS, 4000 * PAIRS.length, perPair);
 
 // UI
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
-const status = $('status'), openBtn = $<HTMLButtonElement>('open'), warn = $('warn'), note = $('note');
+const status = $('status'), openBtn = $<HTMLButtonElement>('open'), soundBtn = $<HTMLButtonElement>('sound');
+const warn = $('warn'), note = $('note'), hud = $('hud');
 
 if (matchMedia('(pointer: coarse)').matches) {
   openBtn.hidden = true;
@@ -106,83 +117,114 @@ openBtn.onclick = () => {
   }
 };
 
+soundBtn.onclick = async () => {
+  soundBtn.textContent = (await choir.toggle()) ? 'Sound on' : 'Sound off';
+};
+
+// Scroll to grow or shrink this window's economy. Bigger economies trade more and sing louder.
+addEventListener('wheel', (e) => {
+  sync.self.m = THREE.MathUtils.clamp(sync.self.m * Math.exp(-e.deltaY * 0.0015), 0.4, 3.5);
+}, { passive: true });
+
 addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
   uniforms.uView.value.set(innerWidth, innerHeight);
 });
 
-// Each window eases every orb itself, from the same broadcast targets.
-const idPhase = (id: string) => {
+// A stable 0..1 number per window id, the same in every window
+const idFrac = (id: string) => {
   let h = 0;
   for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) | 0;
-  return ((h >>> 0) / 4294967296) * Math.PI * 2;
+  return (h >>> 0) / 4294967296;
 };
+// Each window has its own rhythm, set by its open order: 0.4, 0.5, 0.6, 0.7 Hz. Neighbours differ by about
+// 0.63 rad/s, which the coupling beats only when they are close, so distance visibly breaks the lock.
+const naturalRate = (ci: number) => TAU * (0.4 + 0.1 * ci);
+
+// Each window eases every orb itself, from the same broadcast targets.
 type Orb = { x: number; y: number; r: number; vx: number; vy: number };
 const orbs = new Map<string, Orb>();
 let prev = performance.now();
+let hudAt = 0;
 
 function frame(now: number) {
   requestAnimationFrame(frame);
   const dt = Math.min((now - prev) / 1000, 0.05);
   prev = now;
 
+  const me = sync.self;
   const rect = sync.tick(); // live rect for this window; sends an update if it moved
-  const peers = sync.peers();
-  const all = [{ id: sync.id, opened: sync.opened, rect }, ...peers]
-    .sort((a, b) => a.opened - b.opened || (a.id < b.id ? -1 : 1));
-  const T = ((performance.timeOrigin + performance.now()) / 1000) % 1024; // shared wall clock
+  const nowMs = wall();
+  const T = (nowMs / 1000) % 1024; // shared wall clock
   uniforms.uTime.value = T;
+
+  const peers = sync.peers();
+  const self: Peer = { id: sync.id, opened: sync.opened, rect, m: me.m, ph: me.ph, w: me.w, at: nowMs };
+  const all = [self, ...peers].sort((a, b) => a.opened - b.opened || (a.id < b.id ? -1 : 1));
 
   // The first four windows link up. A later window shows its own solo orb, like a lone instance.
   const mine = all.findIndex((w) => w.id === sync.id);
-  const wins = mine < MAX ? all.slice(0, MAX) : [all[mine]];
+  const wins = mine < MAX ? all.slice(0, MAX) : [self];
   const colorOf = (i: number) => (mine < MAX ? i : mine) % COLS.length;
+  const slot = wins.findIndex((w) => w.id === sync.id);
 
-  const centre = wins.map((w) => ({ x: w.rect.x + w.rect.w / 2, y: w.rect.y + w.rect.h / 2, m: Math.min(w.rect.w, w.rect.h) }));
-  const paired = wins.map(() => 0);
+  const centre = wins.map((w) => ({ x: w.rect.x + w.rect.w / 2, y: w.rect.y + w.rect.h / 2, px: Math.min(w.rect.w, w.rect.h) }));
+  const paired = wins.map(() => 0); // 0..1, how close each orb is to another (drives sync, repel, pitch)
   const nearest = wins.map(() => -1);
-  uniforms.uPair.value.fill(0);
+  const pairS = new Array<number>(PAIRS.length).fill(0);
+  uniforms.uFlow.value.fill(0);
   uniforms.uOv.value.forEach((v) => v.set(0, 0, 0, 0));
   for (let i = 0; i < wins.length; i++) {
     for (let j = i + 1; j < wins.length; j++) {
-      const a = wins[i].rect, b = wins[j].rect;
+      const a = wins[i], b = wins[j];
       const d = Math.hypot(centre[i].x - centre[j].x, centre[i].y - centre[j].y);
-      // paired when about a window width apart or closer, unpaired beyond about two
-      const s = 1 - THREE.MathUtils.smoothstep(d / ((a.w + b.w) / 2), 1.4, 2.2);
-      const k = i * (7 - i) / 2 + j - i - 1; // same index as pid() in the shaders
-      uniforms.uPair.value[k] = s;
+      const dn = d / ((a.rect.w + b.rect.w) / 2); // distance in window widths
+      const s = 1 - THREE.MathUtils.smoothstep(dn, 1.4, 2.2); // paired when about a width apart or closer
+      const k = pairIndex(i, j);
+      pairS[k] = s;
+      // gravity model of trade: flow grows with both economy sizes and falls with distance
+      uniforms.uFlow.value[k] = 1 - Math.exp(-1.2 * ((a.m * b.m) / Math.max(dn, 0.6)));
       paired[i] = Math.max(paired[i], s);
       paired[j] = Math.max(paired[j], s);
       for (const [p, q] of [[i, j], [j, i]]) {
         const o = nearest[p] < 0 ? Infinity : Math.hypot(centre[p].x - centre[nearest[p]].x, centre[p].y - centre[nearest[p]].y);
         if (d < o) nearest[p] = q;
       }
-      const x0 = Math.max(a.x, b.x), y0 = Math.max(a.y, b.y);
-      const x1 = Math.min(a.x + a.w, b.x + b.w), y1 = Math.min(a.y + a.h, b.y + b.h);
+      const x0 = Math.max(a.rect.x, b.rect.x), y0 = Math.max(a.rect.y, b.rect.y);
+      const x1 = Math.min(a.rect.x + a.rect.w, b.rect.x + b.rect.w), y1 = Math.min(a.rect.y + a.rect.h, b.rect.y + b.rect.h);
       if (x1 > x0 && y1 > y0) uniforms.uOv.value[k].set(x0, y0, x1 - x0, y1 - y0);
     }
   }
 
+  // Kuramoto coupling: this window's rhythm is pulled toward its paired neighbours' rhythms.
+  // Each window owns its own phase and broadcasts it, so every window shows the same pulses.
+  let pull = 0;
+  wins.forEach((w, j) => {
+    if (j !== slot && slot >= 0) pull += pairS[pairIndex(slot, j)] * Math.sin(phaseNow(w, nowMs) - me.ph);
+  });
+  me.w = naturalRate(colorOf(slot)) + COUPLING * pull;
+  me.ph = (((me.ph + me.w * dt) % TAU) + TAU) % TAU;
+  const phases = wins.map((w) => (w.id === sync.id ? me.ph : phaseNow(w, nowMs)));
   const live = new Set<string>();
   wins.forEach((w, i) => {
     const c = centre[i];
     let tx = c.x, ty = c.y;
     if (nearest[i] < 0) {
       // alone: drift on its own (the phase comes from the window id, so every window agrees)
-      const ph = idPhase(w.id), A = c.m * 0.14;
-      const wall = (performance.timeOrigin + performance.now()) / 1000; // unwrapped, so no jump every 1024 s
-      tx += Math.sin(wall * 0.37 + ph) * A;
-      ty += Math.sin(wall * 0.53 + ph * 1.7) * A;
+      const ph = idFrac(w.id) * TAU, A = c.px * 0.14;
+      const t = nowMs / 1000; // unwrapped, so no jump every 1024 s
+      tx += Math.sin(t * 0.37 + ph) * A;
+      ty += Math.sin(t * 0.53 + ph * 1.7) * A;
     } else {
       // unpaired: pushed away from the nearest orb, but kept inside the window
       const n = centre[nearest[i]];
       const d = Math.max(Math.hypot(c.x - n.x, c.y - n.y), 1);
-      const push = (1 - paired[i]) * c.m * 0.3;
+      const push = (1 - paired[i]) * c.px * 0.3;
       tx += ((c.x - n.x) / d) * push;
       ty += ((c.y - n.y) / d) * push;
     }
-    // paired orbs breathe in step (the shaders pulse brightness with the same clock)
-    const tr = THREE.MathUtils.clamp(c.m * 0.17, 40, 160) * (1 + 0.07 * paired[i] * Math.sin(Math.PI * T));
+    // bigger economy, bigger orb; and it breathes with its own rhythm (the shaders pulse light the same way)
+    const tr = THREE.MathUtils.clamp(c.px * 0.17 * Math.sqrt(w.m), 36, 200) * (1 + 0.07 * Math.sin(phases[i]));
     let o = orbs.get(w.id);
     if (!o) orbs.set(w.id, (o = { x: tx, y: ty, r: tr, vx: 0, vy: 0 }));
     live.add(w.id);
@@ -193,17 +235,56 @@ function frame(now: number) {
     o.r += (tr - o.r) * (1 - Math.exp(-dt * 8));
     uniforms.uOrbs.value[i].set(o.x, o.y, o.r, 1);
     uniforms.uCols.value[i].set(...(COLS[colorOf(i)] as [number, number, number]));
+    uniforms.uPhase.value[i] = phases[i];
   });
   for (let i = wins.length; i < MAX; i++) uniforms.uOrbs.value[i].set(0, 0, 0, 0);
   for (const id of orbs.keys()) if (!live.has(id)) orbs.delete(id);
 
   uniforms.uOrigin.value.set(rect.x, rect.y);
 
+  // Choir: this window sings its own orb. Close windows are in tune; far ones drift sharp or flat.
+  // The note swells with the orb's rhythm, so locked windows swell together.
+  const hz = ROOT_HZ * RATIOS[colorOf(slot) % RATIOS.length];
+  const cents = nearest[slot] < 0 ? 0 : (1 - paired[slot]) * (idFrac(sync.id) * 2 - 1) * 40;
+  choir.update(hz, cents, (0.55 + 0.3 * Math.sin(me.ph)) * (0.5 + 0.25 * me.m));
+
   const text = `${all.length} window${all.length === 1 ? '' : 's'}`
     + (all.length > MAX ? ` (only ${MAX} link up${mine < MAX ? '' : ', this one is solo'})` : '');
   if (status.textContent !== text) status.textContent = text;
   warn.hidden = !peers.some((p) => Math.abs(p.rect.x - rect.x) < 1 && Math.abs(p.rect.y - rect.y) < 1);
 
+  if (now - hudAt > 200) {
+    hudAt = now;
+    hud.replaceChildren(...hudLines(wins, phases, pairS, uniforms.uFlow.value, colorOf, slot));
+  }
+
   renderer.render(scene, camera);
+}
+
+// Small readout: this window's economy size, how in step the rhythms are, and trade per pair.
+function hudLines(wins: Peer[], phases: number[], pairS: number[], flow: number[], colorOf: (i: number) => number, slot: number) {
+  const line = (text: string, ci?: number) => {
+    const el = document.createElement('div');
+    if (ci !== undefined) {
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.style.background = `rgb(${COLS[ci].map((v) => Math.round(v * 255)).join(',')})`;
+      el.append(dot);
+    }
+    el.append(text);
+    return el;
+  };
+  const out: HTMLElement[] = [line(`economy ${sync.self.m.toFixed(1)} (scroll to change)`, slot >= 0 ? colorOf(slot) : undefined)];
+  if (wins.length > 1) {
+    const re = phases.reduce((s, p) => s + Math.cos(p), 0), im = phases.reduce((s, p) => s + Math.sin(p), 0);
+    out.push(line(`rhythm in step ${Math.round((Math.hypot(re, im) / phases.length) * 100)}%`));
+    for (let i = 0; i < wins.length; i++) {
+      for (let j = i + 1; j < wins.length; j++) {
+        const k = pairIndex(i, j);
+        out.push(line(`${NAMES[colorOf(i)]} + ${NAMES[colorOf(j)]}: trade ${Math.round(flow[k] * 100)}${pairS[k] > 0.5 ? ', paired' : ''}`));
+      }
+    }
+  }
+  return out;
 }
 requestAnimationFrame(frame);

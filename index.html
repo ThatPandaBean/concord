@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Entangled</title>
+  <title>Concord</title>
   <style>
     html, body { margin: 0; height: 100%; background: #03040a; overflow: hidden; }
     canvas { position: fixed; inset: 0; display: block; }
@@ -13,12 +13,14 @@
     }
     #ui p { margin: 8px 0 0; }
     #status { opacity: .7; margin-bottom: 8px; }
-    #open {
+    #ui button {
       font: inherit; color: #e8edfb; background: rgba(255, 255, 255, .08);
       border: 1px solid rgba(255, 255, 255, .25); border-radius: 6px;
-      padding: 7px 12px; cursor: pointer;
+      padding: 7px 12px; cursor: pointer; margin-right: 6px;
     }
-    #open:hover { background: rgba(255, 255, 255, .16); }
+    #ui button:hover { background: rgba(255, 255, 255, .16); }
+    #hud { margin-top: 10px; font-size: 12px; opacity: .75; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
     #warn { color: #ffb86b; }
     [hidden] { display: none !important; }
   </style>
@@ -26,7 +28,8 @@
 <body>
   <div id="ui">
     <div id="status"></div>
-    <button id="open">Open a second window</button>
+    <button id="open">Open a second window</button><button id="sound">Sound off</button>
+    <div id="hud"></div>
     <p id="note" hidden></p>
     <p id="warn" hidden>
       Two windows report the same position. If they are not stacked on top of each other,

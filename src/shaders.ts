@@ -13,7 +13,8 @@ uniform vec2 uView;      // this window's page size
 uniform vec2 uScreen;    // monitor size, for the starfield
 uniform float uTime;
 uniform float uDpr;
-uniform float uPair[6];  // 0..1: how paired each window pair is (close = 1, far = 0)
+uniform float uFlow[6];  // 0..1: trade between each window pair (gravity model: size * size / distance)
+uniform float uPhase[4]; // each orb's rhythm phase (rad); coupled orbs end up in step
 uniform vec4 uOv[6];     // screen rect where two windows overlap (w = 0 when they do not)
 attribute vec4 aR;       // per-particle randoms
 attribute vec3 aIdx;     // x: orb (or pair start), y: pair end, z: extra random
@@ -63,15 +64,6 @@ vec3 nearest(int i) {
   }
   return best;
 }
-// how strongly orb i is paired with any other live orb
-float pairedness(int i) {
-  float best = 0.;
-  for (int j = 0; j < 4; j++) {
-    if (j == i || uOrbs[j].w < .5) continue;
-    best = max(best, uPair[pid(min(i, j), max(i, j))]);
-  }
-  return best;
-}
 // magnet frame: axis aimed at the nearest orb, two perpendiculars (one is the view axis)
 void basis(int i, out vec3 ax, out vec3 e2, out vec3 e3, out float prox) {
   vec3 n = nearest(i);
@@ -99,7 +91,7 @@ void main() {
   float s = persp(o.z * 5., p.z);
   float rim = pow(1. - abs(n.z), 2.2);                       // bright at the edge, so it reads as round
   float lit = .55 + .45 * (n.z * .5 + .5);
-  float pulse = 1. + .3 * pairedness(i) * sin(ang(.5));      // paired orbs breathe in step
+  float pulse = 1. + .25 * sin(uPhase[i]);                    // own rhythm; locked orbs breathe in step
   emit(o.xy + p.xy * s, (1.4 + aR.z * 1.4) * s, uCols[i], (.10 + 1.1 * rim) * lit * pulse);
 }
 `;
@@ -139,7 +131,7 @@ void main() {
   vec3 p = (ax * cz + (e2 * cos(ph) + e3 * sin(ph)) * sr) * rr * o.z;
   float s = persp(o.z * 5., p.z);
   vec3 hot = mix(uCols[i], vec3(1., .96, .88), .7);
-  float pulse = 1. + .3 * pairedness(i) * sin(ang(.5));
+  float pulse = 1. + .25 * sin(uPhase[i]);
   emit(o.xy + p.xy * s, (1.6 + aR.w * 2.) * s, hot, .35 * (1. + .5 * prox) * pulse);
 }
 `;
@@ -153,8 +145,8 @@ void main() {
   int ia = int(aIdx.x + .5), ib = int(aIdx.y + .5);
   vec4 A = uOrbs[ia], B = uOrbs[ib];
   if (A.w < .5 || B.w < .5) { hide(); return; }
-  float pr = uPair[pid(ia, ib)];
-  if (fract(aIdx.z * 41.) > mix(.25, 1., pr)) { hide(); return; } // unpaired windows: the stream thins out
+  float pr = uFlow[pid(ia, ib)];
+  if (fract(aIdx.z * 41.) > max(pr, .04)) { hide(); return; }     // weak trade: the stream thins out
   vec2 dv = B.xy - A.xy;
   float len = max(length(dv), 1.);
   vec2 dir = dv / len, perp = vec2(-dir.y, dir.x);
@@ -252,7 +244,7 @@ uniform vec4 uOrbs[4];
 uniform vec3 uCols[4];
 uniform vec2 uOrigin;
 uniform vec2 uView;
-uniform float uPair[6];
+uniform float uFlow[6];
 varying vec2 vUv;
 void main() {
   vec2 px = uOrigin + vec2(vUv.x, 1. - vUv.y) * uView;
@@ -268,7 +260,7 @@ void main() {
       float w = .55 * min(uOrbs[i].z, uOrbs[j].z);
       float dd = length(px - (a + ab * t)) / w;
       float far = 1. / (1. + length(ab) / (6. * (uOrbs[i].z + uOrbs[j].z)));
-      float pr = mix(.2, 1., uPair[i * (7 - i) / 2 + j - i - 1]);
+      float pr = mix(.2, 1., uFlow[i * (7 - i) / 2 + j - i - 1]);
       c += mix(uCols[i], uCols[j], t) * exp(-dd * dd) * .18 * far * pr * (.5 + .5 * sin(t * 3.14159));
     }
   }
