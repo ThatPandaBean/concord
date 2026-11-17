@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Entangled</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #03040a; overflow: hidden; }
+    canvas { position: fixed; inset: 0; display: block; }
+    #ui {
+      position: fixed; top: 16px; left: 16px; z-index: 1; max-width: 340px;
+      font: 13px/1.45 system-ui, sans-serif; color: #c9d1e6;
+    }
+    #ui p { margin: 8px 0 0; }
+    #status { opacity: .7; margin-bottom: 8px; }
+    #open {
+      font: inherit; color: #e8edfb; background: rgba(255, 255, 255, .08);
+      border: 1px solid rgba(255, 255, 255, .25); border-radius: 6px;
+      padding: 7px 12px; cursor: pointer;
+    }
+    #open:hover { background: rgba(255, 255, 255, .16); }
+    #warn { color: #ffb86b; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="status"></div>
+    <button id="open">Open a second window</button>
+    <p id="note" hidden></p>
+    <p id="warn" hidden>
+      Two windows report the same position. If they are not stacked on top of each other,
+      your browser is faking the window position (Brave Shields does this). Turn Shields off
+      for this site, or use Chrome, Edge or Safari.
+    </p>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
